@@ -20791,7 +20791,7 @@ void XE::wexDiagDumpToFile(IOPCIDevice *pci) {
     if (pci) pci->release();
 }
 
-static void wexDiagThreadFn(void *arg) {
+void XE::wexDiagThreadFn(void *arg) {
     XE::wexDiagDumpToFile(static_cast<IOPCIDevice *>(arg));
 }
 

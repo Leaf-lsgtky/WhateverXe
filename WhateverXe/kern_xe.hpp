@@ -991,6 +991,7 @@ private:
 
 
     static void wexDiagDump(IOPCIDevice *pci);
+    static void wexDiagThreadFn(void *arg);
     static void wexDiagDumpToFile(IOPCIDevice *pci);
     static int wexDiagFormat(IOPCIDevice *pci, int pass);
     static XE *callbackXE;
