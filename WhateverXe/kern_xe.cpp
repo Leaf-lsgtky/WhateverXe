@@ -5,7 +5,6 @@
 #include <sys/vnode.h>
 #include <sys/fcntl.h>
 #include <sys/uio.h>
-#include <mach/wait_queue.h>
 //
 //  kern_xe.cpp
 //  WhateverGreen
