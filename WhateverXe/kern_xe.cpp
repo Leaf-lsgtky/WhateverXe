@@ -3962,16 +3962,6 @@ Display13OutputWiring XE::display13BoardWiring(IOService *provider) {
 
 struct WexDiagCtx { IOPCIDevice *pci; };
 
-// These BSD vnode / VFS symbols exist in the kernel but are not declared
-// in MacKernelSDK's public headers.  Declare them so the kext can write a
-// diagnostic file to the USB FAT32 volume when the panel stays black.
-extern "C" {
-    vfs_context_t vfs_context_current(void);
-    int vnode_open(const char *path, int fmode, int cmode, struct vnode **vpp, vfs_context_t ctx);
-    int vnode_close(struct vnode *vp, int flags, vfs_context_t ctx);
-    int VNOP_WRITE(struct vnode *vp, struct uio *uio, int ioflag, vfs_context_t ctx);
-}
-
 static void wexDiagDumpToFile(WexDiagCtx *ctx) {
     IOPCIDevice *pci = ctx->pci;
     char buf[6144]; int n = 0;
@@ -4021,7 +4011,7 @@ static void wexDiagDumpToFile(WexDiagCtx *ctx) {
     for (int attempt = 0; attempt < 40; attempt++) {
         struct vnode *vp = NULL;
         vfs_context_t vctx = vfs_context_current();
-        int err = vnode_open("/Volumes/1401/wex-diag.txt", O_WRONLY|O_CREAT|O_TRUNC, 0644, &vp, vctx);
+        int err = vnode_open("/Volumes/1401/wex-diag.txt", O_WRONLY|O_CREAT|O_TRUNC, 0644, 0, &vp, vctx);
         if (!err && vp) {
             // Use the public uio_create() API: it returns a fully-initialised
             // uio_t (== struct uio *) so we don't need the private uio layout.
