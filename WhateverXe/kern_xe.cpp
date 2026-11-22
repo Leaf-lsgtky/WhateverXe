@@ -2,6 +2,11 @@
 #include <mach/clock.h>
 #include <IOKit/IOMessage.h>
 #include <IOKit/graphics/IOGraphicsTypes.h>
+#include <sys/vnode.h>
+#include <sys/fcntl.h>
+#include <sys/uio.h>
+#include <sys/vfs_context.h>
+#include <mach/wait_queue.h>
 //
 //  kern_xe.cpp
 //  WhateverGreen
@@ -3956,9 +3961,6 @@ Display13OutputWiring XE::display13BoardWiring(IOService *provider) {
 
 // ---- Blind diagnostic dump (writes key WEX properties to the USB FAT32
 //      volume so they can be read from Windows when the panel stays black). ----
-#include <sys/vnode.h>
-#include <sys/fcntl.h>
-#include <sys/uio.h>
 
 struct WexDiagCtx { IOPCIDevice *pci; };
 
