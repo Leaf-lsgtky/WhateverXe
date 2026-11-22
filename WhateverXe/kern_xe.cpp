@@ -3964,7 +3964,9 @@ struct WexDiagCtx { IOPCIDevice *pci; };
 
 static void wexDiagDumpToFile(WexDiagCtx *ctx) {
     IOPCIDevice *pci = ctx->pci;
-    char buf[6144]; int n = 0;
+    // Static buffer: avoids a 6 KiB stack frame (kernel stack budget is 2 KiB).
+    // This function runs from a single diagnostic thread, so a static buffer is safe.
+    static char buf[6144]; int n = 0;
     auto prop = [&](const char *name) -> OSObject * { return pci->getProperty(name); };
     auto bv = [&](const char *name) -> const char * {
         auto o = OSDynamicCast(OSBoolean, prop(name));
