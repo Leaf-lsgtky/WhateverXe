@@ -266,6 +266,7 @@ int main() {
         const auto scaledHeight=plan(3360,2720,1205325351ULL,2008,latency,true,true,1890);
         assert(scaledHeight.status==Status::Complete && scaledHeight.sagv.enable);
         LatchIO io(scaledHeight);io.moveToPipe(0);io.clock=1305600000;
+        io.regs[0x70180]=0x84001000;
         io.regs[0x70190]=((1890U-1)<<16)|(3360U-1);
         io.regs[0x60000]=((2720U-1)<<16)|(2560U-1);
         io.regs[0x6000C]=((1559U-1)<<16)|(1440U-1);
