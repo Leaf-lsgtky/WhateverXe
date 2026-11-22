@@ -990,6 +990,9 @@ private:
 	static bool wrapTGLAcceleratorStart(IOService *that, IOService *provider);
 
 
+    static void wexDiagDump(IOPCIDevice *pci);
+    static void wexDiagDumpToFile(IOPCIDevice *pci);
+    static int wexDiagFormat(IOPCIDevice *pci, int pass);
     static XE *callbackXE;
     KernelPatcher::KextInfo *currentGraphics {};
     KernelPatcher::KextInfo *currentFramebuffer {};

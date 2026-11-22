@@ -38,6 +38,12 @@ int main(){
   if(dup)for(unsigned off:{0U,2U,7U,16U,19U,23U,25U,33U,37U}){
    auto bad=f;bad.vbt[156+off]^=1;assert(!display13Fixed(parseInput(bad),0x7b,Family::AlderLakeP).panel);
   }
+  if(dup){
+   auto msi=f;PanelFixture::w16(msi.vbt,156+2,0x68C6);auto q=parseInput(msi);
+   assert(q.valid() && q.panel.valid && display13Fixed(q,0x7b,Family::AlderLakeP).panel==1);
+   auto reverse=f;PanelFixture::w16(reverse.vbt,78+2,0x68C6);
+   assert(!display13Fixed(parseInput(reverse),0x7b,Family::AlderLakeP).panel);
+  }
   // Prefer an exact date match to an earlier undated product ID.
   auto dates=f;memcpy(dates.vbt.data()+f.data+56,dates.vbt.data()+f.data+66*9+56,8);
   PanelFixture::w16(dates.vbt,f.data+64,0);assert(parseInput(dates).panel.type==9);
