@@ -3962,6 +3962,16 @@ Display13OutputWiring XE::display13BoardWiring(IOService *provider) {
 
 struct WexDiagCtx { IOPCIDevice *pci; };
 
+// These BSD vnode / VFS symbols exist in the kernel but are not declared
+// in MacKernelSDK's public headers.  Declare them so the kext can write a
+// diagnostic file to the USB FAT32 volume when the panel stays black.
+extern "C" {
+    vfs_context_t vfs_context_current(void);
+    int vnode_open(const char *path, int fmode, int cmode, struct vnode **vpp, vfs_context_t ctx);
+    int vnode_close(struct vnode *vp, int flags, vfs_context_t ctx);
+    int VNOP_WRITE(struct vnode *vp, struct uio *uio, int ioflag, vfs_context_t ctx);
+}
+
 static void wexDiagDumpToFile(WexDiagCtx *ctx) {
     IOPCIDevice *pci = ctx->pci;
     char buf[6144]; int n = 0;
@@ -4013,13 +4023,14 @@ static void wexDiagDumpToFile(WexDiagCtx *ctx) {
         vfs_context_t vctx = vfs_context_current();
         int err = vnode_open("/Volumes/1401/wex-diag.txt", O_WRONLY|O_CREAT|O_TRUNC, 0644, &vp, vctx);
         if (!err && vp) {
-            struct uio auio; struct iovec aiov;
-            aiov.iov_base = (void *)buf; aiov.iov_len = n;
-            auio.uio_iov = &aiov; auio.uio_iovcnt = 1;
-            auio.uio_offset = 0; auio.uio_resid = n;
-            auio.uio_segflg = UIO_SYSSPACE; auio.uio_rw = UIO_WRITE;
-            auio.uio_procp = NULL;
-            VNOP_WRITE(vp, &auio, 0, vctx);
+            // Use the public uio_create() API: it returns a fully-initialised
+            // uio_t (== struct uio *) so we don't need the private uio layout.
+            uio_t auio = uio_create(1, 0, UIO_SYSSPACE, UIO_WRITE);
+            if (auio) {
+                uio_addiov(auio, (user_addr_t)buf, (user_size_t)n);
+                VNOP_WRITE(vp, auio, 0, vctx);
+                uio_free(auio);
+            }
             vnode_close(vp, O_WRONLY, vctx);
             break;
         }
@@ -4028,7 +4039,7 @@ static void wexDiagDumpToFile(WexDiagCtx *ctx) {
     IOFree(ctx, sizeof(*ctx));
 }
 
-static void wexDiagThread(void *arg, wait_result_t) {
+static void wexDiagThread(void *arg) {
     wexDiagDumpToFile(static_cast<WexDiagCtx *>(arg));
 }
 
@@ -4036,8 +4047,10 @@ static void wexDiagDump(IOPCIDevice *pci) {
     WexDiagCtx *ctx = (WexDiagCtx *)IOMalloc(sizeof(*ctx));
     if (!ctx) return;
     ctx->pci = pci;
-    thread_t th;
-    if (IOCreateThread(wexDiagThread, ctx, &th) != KERN_SUCCESS)
+    // MacKernelSDK IOCreateThread: IOThreadFunc = void (*)(void *),
+    // returns IOThread (non-zero == success).
+    IOThread th = IOCreateThread(wexDiagThread, ctx);
+    if (!th)
         IOFree(ctx, sizeof(*ctx));
 }
 
