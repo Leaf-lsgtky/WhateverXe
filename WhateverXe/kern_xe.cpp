@@ -3954,7 +3954,92 @@ Display13OutputWiring XE::display13BoardWiring(IOService *provider) {
     return board;
 }
 
+// ---- Blind diagnostic dump (writes key WEX properties to the USB FAT32
+//      volume so they can be read from Windows when the panel stays black). ----
+#include <sys/vnode.h>
+#include <sys/fcntl.h>
+#include <sys/uio.h>
 
+struct WexDiagCtx { IOPCIDevice *pci; };
+
+static void wexDiagDumpToFile(WexDiagCtx *ctx) {
+    IOPCIDevice *pci = ctx->pci;
+    char buf[6144]; int n = 0;
+    auto prop = [&](const char *name) -> OSObject * { return pci->getProperty(name); };
+    auto bv = [&](const char *name) -> const char * {
+        auto o = OSDynamicCast(OSBoolean, prop(name));
+        return o ? (o->isTrue() ? "Yes" : "No") : "absent";
+    };
+    auto nv = [&](const char *name) -> uint64_t {
+        auto o = OSDynamicCast(OSNumber, prop(name));
+        return o ? o->unsigned64BitValue() : UINT64_MAX;
+    };
+    n += snprintf(buf+n, sizeof(buf)-n, "WhateverXe diagnostic dump\n");
+    n += snprintf(buf+n, sizeof(buf)-n, "N97Admission=%s\n", bv("N97Admission"));
+    n += snprintf(buf+n, sizeof(buf)-n, "N97GTTopologyReady=%s\n", bv("N97GTTopologyReady"));
+    n += snprintf(buf+n, sizeof(buf)-n, "N97NativePreflight=%s\n", bv("N97NativePreflight"));
+    n += snprintf(buf+n, sizeof(buf)-n, "N97NativeStartAllowed=%s\n", bv("N97NativeStartAllowed"));
+    n += snprintf(buf+n, sizeof(buf)-n, "N97NativeProbeBlocked=%s\n", bv("N97NativeProbeBlocked"));
+    n += snprintf(buf+n, sizeof(buf)-n, "WEXDisplay13BootReady=%s\n", bv("WEXDisplay13BootReady"));
+    n += snprintf(buf+n, sizeof(buf)-n, "N97FramebufferBackendReady=%s\n", bv("N97FramebufferBackendReady"));
+    n += snprintf(buf+n, sizeof(buf)-n, "N97FramebufferOriginalStart=%s\n", bv("N97FramebufferOriginalStart"));
+    n += snprintf(buf+n, sizeof(buf)-n, "N97FramebufferStartAccepted=%s\n", bv("N97FramebufferStartAccepted"));
+    n += snprintf(buf+n, sizeof(buf)-n, "N97ReservedGGTT=%s\n", bv("N97NativeReservedGGTT"));
+    n += snprintf(buf+n, sizeof(buf)-n, "N97NativeKernelReady=%s\n", bv("N97NativeKernelReady"));
+    n += snprintf(buf+n, sizeof(buf)-n, "WhateverXeFirmwarePorts=%llu\n", nv("WhateverXeFirmwarePorts"));
+    n += snprintf(buf+n, sizeof(buf)-n, "N97DisplayStep=");
+    { auto s=OSDynamicCast(OSString,prop("N97DisplayStep")); if(s) n+=snprintf(buf+n,sizeof(buf)-n,"%s",s->getCStringNoCopy()); else n+=snprintf(buf+n,sizeof(buf)-n,"absent"); }
+    n += snprintf(buf+n, sizeof(buf)-n, "\nN97GTStep=");
+    { auto s=OSDynamicCast(OSString,prop("N97GTStep")); if(s) n+=snprintf(buf+n,sizeof(buf)-n,"%s",s->getCStringNoCopy()); else n+=snprintf(buf+n,sizeof(buf)-n,"absent"); }
+    auto src = OSDynamicCast(OSData, prop("N97NativeBootSource"));
+    if (src && src->getLength() >= 20) {
+        const uint32_t *v = (const uint32_t *)src->getBytesNoCopy();
+        n += snprintf(buf+n, sizeof(buf)-n, "\nN97NativeBootSource: adopted=%u bootDDI=%u protocol=%u planStatus=0x%x tc=%u\n",
+            v[0], v[1], v[2], v[3], v[4]);
+    } else n += snprintf(buf+n, sizeof(buf)-n, "\nN97NativeBootSource: absent\n");
+    auto hand = OSDynamicCast(OSData, prop("WEXDisplay13BootHandoff"));
+    if (hand) n += snprintf(buf+n, sizeof(buf)-n, "WEXDisplay13BootHandoff: len=%u\n", hand->getLength());
+    auto fb = OSDynamicCast(OSData, prop("N97FBBootHandoff"));
+    if (fb) n += snprintf(buf+n, sizeof(buf)-n, "N97FBBootHandoff: len=%u\n", fb->getLength());
+    n += snprintf(buf+n, sizeof(buf)-n, "N97FBApertureFirstFailure=");
+    { auto a=OSDynamicCast(OSData,prop("N97FBApertureFirstFailure")); if(a) n+=snprintf(buf+n,sizeof(buf)-n,"len=%u",a->getLength()); else n+=snprintf(buf+n,sizeof(buf)-n,"absent"); }
+    n += snprintf(buf+n, sizeof(buf)-n, "\nN97FBPipe0PrimaryWM=");
+    { auto w=OSDynamicCast(OSData,prop("N97FBPipe0PrimaryWM")); if(w) n+=snprintf(buf+n,sizeof(buf)-n,"len=%u",w->getLength()); else n+=snprintf(buf+n,sizeof(buf)-n,"absent"); }
+    n += snprintf(buf+n, sizeof(buf)-n, "\n--- end ---\n");
+
+    // Retry: the FAT32 USB volume mounts after diskarbitrationd starts.
+    for (int attempt = 0; attempt < 40; attempt++) {
+        struct vnode *vp = NULL;
+        vfs_context_t vctx = vfs_context_current();
+        int err = vnode_open("/Volumes/1401/wex-diag.txt", O_WRONLY|O_CREAT|O_TRUNC, 0644, &vp, vctx);
+        if (!err && vp) {
+            struct uio auio; struct iovec aiov;
+            aiov.iov_base = (void *)buf; aiov.iov_len = n;
+            auio.uio_iov = &aiov; auio.uio_iovcnt = 1;
+            auio.uio_offset = 0; auio.uio_resid = n;
+            auio.uio_segflg = UIO_SYSSPACE; auio.uio_rw = UIO_WRITE;
+            auio.uio_procp = NULL;
+            VNOP_WRITE(vp, &auio, 0, vctx);
+            vnode_close(vp, O_WRONLY, vctx);
+            break;
+        }
+        IOSleep(2000);
+    }
+    IOFree(ctx, sizeof(*ctx));
+}
+
+static void wexDiagThread(void *arg, wait_result_t) {
+    wexDiagDumpToFile(static_cast<WexDiagCtx *>(arg));
+}
+
+static void wexDiagDump(IOPCIDevice *pci) {
+    WexDiagCtx *ctx = (WexDiagCtx *)IOMalloc(sizeof(*ctx));
+    if (!ctx) return;
+    ctx->pci = pci;
+    thread_t th;
+    if (IOCreateThread(wexDiagThread, ctx, &th) != KERN_SUCCESS)
+        IOFree(ctx, sizeof(*ctx));
+}
 
 void XE::adlnBootstrap(IOPCIDevice *pci) {
 	pci->setProperty("N97BringupVersion", 1ULL, 32);
@@ -4329,6 +4414,7 @@ void XE::adlnBootstrap(IOPCIDevice *pci) {
 
     IOFree(snapshot,sizeof(*snapshot));
 	map->release();
+    wexDiagDump(pci);
 }
 
 bool XE::xelpBindProbe(void *controller) {
