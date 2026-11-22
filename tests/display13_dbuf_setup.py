@@ -7,8 +7,9 @@ r = Path(__file__).resolve().parents[1]
 s = read_source(r/'WhateverXe/kern_xe.cpp')
 guard = re.search(r'bool XE::dsiSharedWriterStopped\(.*?\n\}', s, re.S).group()
 body = re.search(r'void XE::adlnSetupDBUFPipe\(.*?\n\}', s, re.S).group()
+linetime = re.search(r'static uint64_t display13LineTimePixel\(.*?\n\}', s, re.S).group()
 pipewm = re.search(r'void XE::wrapAlderLakeNPipeWMSetup\(.*?\n\}', s, re.S).group()
-code = (r / 'tests/display13_dbuf_setup_fixture.cpp').read_text().replace('// PRODUCTION_SETUP', guard+'\n'+body+'\n'+pipewm)
+code = (r / 'tests/display13_dbuf_setup_fixture.cpp').read_text().replace('// PRODUCTION_SETUP', guard+'\n'+body+'\n'+linetime+'\n'+pipewm)
 with tempfile.TemporaryDirectory(prefix='dbuf-setup-') as d:
     p = Path(d)
     (p / 'test.cpp').write_text(code)

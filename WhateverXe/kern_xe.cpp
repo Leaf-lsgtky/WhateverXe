@@ -4812,7 +4812,7 @@ struct Display13FBIRQContext {
 	IOSimpleLock *lock {};
 	IOService *controller {};
 	Display13FBIRQ::State state;
-	unsigned handlers {},softwareHandlers {};bool quiescing {},powerLost {},rearmPending {};uint32_t blockedPipes {};
+	unsigned handlers {},softwareHandlers {};bool quiescing {},powerLost {},rearmPending {},faultPublished {};uint32_t blockedPipes {};
 	uintptr_t softwareThread {};
 	Display13FBIRQ::HandlerScopes scopes;
 	volatile uint32_t admittedPipes {}; // Release-published after actual path/backing proof.
@@ -4978,7 +4978,8 @@ static void adlnIRQRecord(uint64_t (&r)[32],unsigned event) {
 	r[10]=s.interrupts;
 	for(unsigned p=0;p<3;++p) {r[11+p]=s.vblanks[p];r[14+p]=s.flips[p];r[17+p]=s.underruns[p];r[20+p]=s.dsbErrors[p];r[23+p]=s.raw[p];}
 	r[26]=s.lastPCH;r[27]=s.lastDDI;r[28]=reinterpret_cast<uintptr_t>(c.controller);
-	r[29]=reinterpret_cast<uintptr_t>(c.lock);r[30]=c.handlers;r[31]=c.quiescing|(c.blockedPipes<<8)|(uint64_t(c.softwareHandlers)<<32);
+	r[29]=reinterpret_cast<uintptr_t>(c.lock);r[30]=c.handlers;
+	r[31]=c.quiescing|(c.blockedPipes<<8)|(uint64_t(c.softwareHandlers&0xFFFF)<<32)|(uint64_t(s.storms&0xFFFF)<<48);
 }
 
 
@@ -5222,6 +5223,9 @@ static bool adlnBeginClockGuard(Display13FBClockGuard &g) {
 	if(irq.quiescing || g.master==UINT32_MAX) {IOSimpleLockUnlockEnableInterrupt(irq.lock,saved);failure(2);return false;}
 	g.held=true;g.enabled=irq.state.enabled;irq.quiescing=true;irq.blockedPipes=7;
 	io.write(Display13FBIRQ::Master,0);irq.state.enabled=false;
+	// Refresh the native cached DE master (c+D84) too: ProcessInterrupt restores the master
+	// from it, which would re-arm DE inside this scope and spin on a deferred display bit.
+	{Display13FBIRQIO irqIO {irq.base};adlnIRQCache(irq.controller,irqIO);}
 	IOSimpleLockUnlockEnableInterrupt(irq.lock,saved);
 	bool quiet=false;
 	for(unsigned ms=0;ms<=20;++ms) {
@@ -6179,6 +6183,7 @@ void XE::wrapDisplay13FBConfigureVBL(IOService *controller,IOService *fb,OSObjec
 	const bool valid=display13FBAssociations(controller,0x1C20,fb,fb->getMetaClass()->getClassSize(),display13FBExpectedOwner(controller)) &&
 		path->getMetaClass()->getClassSize()>=0x3730;
 	const auto pipe=valid ? Display13FBMemory::field<uint32_t>(path,0x3640) : 3;
+	c.state.sinceVBlank=0; // native VBL control activity: not an interrupt storm
 	if(c.quiescing || (pipe<3 && (c.blockedPipes&(1U<<pipe)))) {
 		c.status=Display13FBIRQ::Status::Power;adlnIRQCache(controller,io);
 		if(getLock)IOSimpleLockUnlockEnableInterrupt(c.lock,saved);return;
@@ -6211,7 +6216,15 @@ void XE::wrapDisplay13FBConfigureVBL(IOService *controller,IOService *fb,OSObjec
 	}
 	else c.status=Display13FBIRQ::fail(io,c.state,Display13FBIRQ::Status::Topology);
 	adlnIRQCache(controller,io);
+	// Publish the first fault seen here (e.g. the interrupt storm breaker) once, so it can be
+	// read without waiting for the next native Enable/DisableIRQ. Registry writes need the
+	// simple lock released, so only when this call took it.
+	uint64_t record[32] {};
+	const bool publish=getLock && c.state.faulted && !c.faultPublished;
+	if(publish) {c.faultPublished=true;adlnIRQRecord(record,3);}
+	else if(!c.state.faulted)c.faultPublished=false;
 	if(getLock)IOSimpleLockUnlockEnableInterrupt(c.lock,saved);
+	if(publish)controller->setProperty("N97FBIRQFault",record,sizeof(record));
 }
 bool XE::wrapDisplay13FBProcessIRQ(IOService *controller) {
 	if(!adlnIRQOwner(controller))return false;
@@ -6261,13 +6274,22 @@ void XE::wrapDisplay13FBProcessDE(IOService *controller,uint32_t *pipe,uint32_t 
 	// Native ProcessInterrupt already holds c+90. Permission belongs to its
 	// entry scope, even if a power/clock caller restored state.enabled since.
 	// Keep all hardware pending untouched for a subsequent permitted handler.
-	if(!c.scopes.permits(reinterpret_cast<uintptr_t>(current_thread())))return;
-	const auto e=Display13FBIRQ::collect(io,c.state);c.status=e.status;
-	*pipe=e.pipe;*aux=e.aux;*hotplug=e.hotplug;
-	if(c.state.faulted) {
+	const auto dropCache=[controller] {
 		*reinterpret_cast<uint32_t *>(reinterpret_cast<uint8_t *>(controller)+0xD84)=0;
 		*(reinterpret_cast<uint8_t *>(controller)+0xFD4)=0;
+	};
+	if(!c.scopes.permits(reinterpret_cast<uintptr_t>(current_thread()))) {
+		// The native ProcessInterrupt re-arms the DE master from c+D84 after this call and
+		// loops while the GT master still shows a display bit: with nothing serviced it never
+		// returns (CPU 0 livelock in interrupt context, spinlock-timeout panics after display
+		// wake, Precision 5570). A disabled bank stays off in hardware and in the cache; its
+		// pending statuses remain for the permitted handler once the scope ends.
+		if(!c.state.enabled) {dropCache();if(io.readable(Display13FBIRQ::Master))io.write(Display13FBIRQ::Master,0);}
+		return;
 	}
+	const auto e=Display13FBIRQ::collect(io,c.state);c.status=e.status;
+	*pipe=e.pipe;*aux=e.aux;*hotplug=e.hotplug;
+	if(c.state.faulted || !c.state.enabled)dropCache();
 }
 
 bool XE::processDisplay13FramebufferGTT(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
@@ -8946,6 +8968,7 @@ bool XE::adlnFreeStoppedPipe(IOService *fb) {
                 // stays disabled through native free; native SW queue/FD4 and
                 // GT callbacks remain intact for another pipe's old events.
                 io.write(Display13FBIRQ::Master,0);irq.state.enabled=false;irq.quiescing=true;irq.blockedPipes|=1U<<pipe;held=true;
+                adlnIRQCache(controller,io); // native cached master must not re-arm DE in the scope
                 const auto parked=Display13FBIRQ::parkStoppedPipe(io,irq.state,pipe,irq.handlers,irq.softwareHandlers,queued);
                 record[9]=static_cast<uint32_t>(parked);ready=parked==Display13FBIRQ::Status::Complete;
             }
@@ -9526,7 +9549,7 @@ void XE::adlnWMSetup(OSObject *plane,OSObject *path,bool cursor) {
 			// Audited native pixel/scaling calculation is CPU-only. Preserve its
 			// path frequency and downscale behavior rather than assuming FHD Hz.
 			auto adjust=reinterpret_cast<uint64_t (*)(void *,void *,void *,bool,void *)>(callbackXE->adlnAdjustPixelClock);
-			const auto pixel=adjust(c.controller,fb,path,cursor,nullptr);
+			const auto pixel=Display13WM::planePixelHz(adjust(c.controller,fb,path,cursor,nullptr),c.clock.nativeHz());
 			p=Display13WM::plan(width,htotal,pixel,range.end-range.start,c.latency,(ipc&8) || Display13FBMemory::field<uint8_t>(c.controller,0x1B4C),yTiled,cursor ? width : ((Display13FBMemory::field<uint32_t>(plane,0x11C)>>16)&0x1FFF)+1);
 			if(p.status==Display13WM::Status::Complete) {
 				auto object=reinterpret_cast<uint8_t *>(plane);
@@ -9576,6 +9599,17 @@ void XE::adlnWMSetup(OSObject *plane,OSObject *path,bool cursor) {
 void XE::wrapAlderLakeNPlaneWMSetup(OSObject *plane,OSObject *path) {adlnWMSetup(plane,path,false);}
 void XE::wrapDisplay13CursorWMSetup(OSObject *plane,OSObject *path) {adlnWMSetup(plane,path,true);}
 
+// WM_LINETIME and the frame period follow the pipe's own pixel clock (native
+// base at path+0x118, doubled per fb+0x425c), not the rate that
+// adjustPixelClockForWatermarks raises by the pipe-scaler downscale ratio (i915).
+// Without a downscale the two are equal, so a native-size mode is unchanged.
+static uint64_t display13LineTimePixel(IOService *fb,OSObject *path,uint64_t adjusted) {
+	if(!fb || !path || fb->getMetaClass()->getClassSize()<0x4B90 ||
+	   path->getMetaClass()->getClassSize()<0x3730)return adjusted;
+	auto base=Display13FBMemory::field<uint64_t>(path,0x118);
+	if(Display13FBMemory::field<uint8_t>(fb,0x425c))base*=2;
+	return base && base<=adjusted ? base : adjusted;
+}
 void XE::wrapAlderLakeNPipeWMSetup(IOService *controller,IOService *fb,OSObject *path,void *params) {
 	auto &c=display13FBPower;if(!c.lock)return;
 	uint64_t record[8] {};IOLockLock(c.lock);
@@ -9599,7 +9633,7 @@ void XE::wrapAlderLakeNPipeWMSetup(IOService *controller,IOService *fb,OSObject 
 		auto crtc=params ? params : reinterpret_cast<uint8_t *>(path)+0x128;
 		const auto htotal=((Display13FBMemory::field<uint32_t>(crtc,0x10)>>16)&0x3FFF)+1;
 		auto adjust=reinterpret_cast<uint64_t (*)(void *,void *,void *,bool,void *)>(callbackXE->adlnAdjustPixelClock);
-		const auto pixel=adjust(controller,fb,path,true,crtc);
+		const auto pixel=display13LineTimePixel(fb,path,adjust(controller,fb,path,true,crtc));
 		const auto value=Display13WM::pipeLineTime(htotal,pixel);
 		*reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(crtc)+0x84)=value;
 		if(!value)adlnFault(c.watermarkFaulted,__LINE__);
@@ -9809,7 +9843,7 @@ Display13WM::Latch XE::adlnVerifyWMLatch(IOService *fb,uint64_t nativeHz,uint64_
 		void delayUs(unsigned us) {IOSleep(us/1000);}
 	} io {c.map};
 	auto adjust=reinterpret_cast<uint64_t (*)(void *,void *,void *,bool,void *)>(callbackXE->adlnAdjustPixelClock);
-	const auto pipePixel=adjust(c.controller,fb,path,true,nullptr);
+	const auto pipePixel=display13LineTimePixel(fb,path,adjust(c.controller,fb,path,true,nullptr));
     const auto primaryRaw=Display13DBUF::hardwareRaw(c.dbuf,pipe,c.dbuf.pipe[pipe].primary);
     const auto cursorRaw=Display13DBUF::hardwareRaw(c.dbuf,pipe,c.dbuf.pipe[pipe].cursor);
     if(primaryRaw==UINT32_MAX || cursorRaw==UINT32_MAX) {result.status=Display13WM::Status::Input;return result;}
@@ -10131,6 +10165,10 @@ bool XE::enableDisplay13EngineLocked(void *power) {
 		!c.bridge.state.suspended && acquired.status==Display13Power::Status::Complete && clockReady && !c.clockFaulted && clock.status==Display13Clock::Status::Complete &&
 		Display13Power::objectAssociations(power,0x80,c.controller,0x1C20)) {
 		Display13FBDBUFIO io {c.map};
+		// -wex-hidpi-dbuf: a cursor behind the pipe scaler is charged the downscale. At 165/180 Hz
+		// its SAGV watermark exceeds 40 blocks; with the native 40
+		// the plan has none, and program() would fault the watermark owner for good.
+		if(checkKernelArgument("-wex-hidpi-dbuf"))c.dbuf.cursorBlocks=96;
 		status=Display13DBUF::begin(io,c.dbuf,__builtin_popcount(callbackXE->adlnOutputWiring.selected())>=3 ? 7U : 0U,c.transcoders);
 		if(status==Display13DBUF::Status::Complete) {
 			if(acquired.status==Display13Power::Status::Complete)status=Display13DBUF::resumeEngine(io,c.dbuf);
@@ -10562,6 +10600,21 @@ void XE::wrapAlderLakeNPlanarDBUFWrite(void *access,uint64_t reg,uint32_t value)
 	uint64_t record[14] {2,reg,value};auto status=Display13DBUF::Status::Unavailable;
 	auto path=Display13FBMemory::singlePath<OSObject *>(fb);
 	auto plane=path && path->getMetaClass()->getClassSize()>=0x3730 ? Display13FBMemory::field<OSObject *>(path,0x32C8) : nullptr;
+	// -wex-hidpi-dbuf: this donor helper also writes the initial RGB allocation, split a
+	// third/two thirds as for planar YUV and past a fixed 40-block cursor prefix. At native
+	// size the layout setup replaces it later, but in a pipe-scaled mode it runs last and
+	// the primary underruns on motion (retropineaple, 9d28483).
+	// Give an RGB primary the allocation this pipe is planned to have.
+	if(c.dbuf.cursorBlocks!=40 && plane && plane->getMetaClass()->getClassSize()>=0x1C8 &&
+		Display13WM::supportedRGBControl(Display13FBMemory::field<uint32_t>(plane,0x100)) &&
+		Display13FBMemory::field<uint32_t>(plane,0x10C)==value) {
+		const auto planned=Display13DBUF::plannedLayout(c.dbuf.capacity ? c.dbuf.capacity : c.dbuf.selected,pipe,c.dbuf.cursorBlocks);
+		const auto wanted=planned.status==Display13DBUF::Status::Complete ? Display13DBUF::hardwareRaw(c.dbuf,pipe,planned.primary) : UINT32_MAX;
+		if(wanted!=UINT32_MAX && wanted && wanted!=value) {
+			record[2]=value|(uint64_t(wanted)<<32);
+			*reinterpret_cast<uint32_t *>(reinterpret_cast<uint8_t *>(plane)+0x10C)=wanted;value=wanted;
+		}
+	}
 	const auto binding=adlnInspectPathBinding(fb,path,callbackXE->adlnPlatform,callbackXE->adlnOutputWiring);
 	const bool associated=plane && binding.status==TGLFBBinding::Status::Complete && binding.pipe==pipe &&
 		Display13FBMemory::boundPipe(c.pipe,fb)==pipe && Display13FBMemory::field<void *>(plane,0x90)==access && access==c.access &&
@@ -10993,7 +11046,8 @@ bool XE::adlnPowerReference(void *power,uint32_t operation,uint32_t domain) {
 					Display13FBIRQ::beginPowerRelease(irqIO,irq.state,releaseScope,released,affected,
 						irq.scopes.display,competingSoftware,queued,aux,hpd) : Display13FBIRQ::Status::Unavailable;
 				irqRelease[9]=static_cast<uint32_t>(status);releaseAllowed=status==Display13FBIRQ::Status::Complete;
-				if(releaseScope.held) {irq.quiescing=true;irq.blockedPipes=affected;}
+				if(releaseScope.held) {irq.quiescing=true;irq.blockedPipes=affected;
+					adlnIRQCache(static_cast<IOService *>(c.controller),irqIO);} // master parked: drop native cache
 			} else {
 				releaseAllowed=!irq.quiescing && Display13FBIRQ::quiescentPipes(irqIO,irq.state,released,irq.handlers,affected);
 				if(releaseAllowed) {irq.quiescing=true;irq.blockedPipes=affected;}
@@ -11367,6 +11421,81 @@ bool XE::processAlderLakeNTaskBoundary(KernelPatcher &patcher, size_t index, mac
 	return ready;
 }
 
+// -wex-scanout-coherent: surfaceStateFillMemoryObjectControlState gives a
+// displayable IOSurface a MOCS that does not keep its writes in the LLC; the
+// display engine reads memory without snooping the LLC. WindowServer's
+// backing for a downscaled HiDPI mode (larger than the panel) is not marked
+// displayable but is still flipped to the plane, so the display showed
+// whatever the LLC had not written back yet. Treat a storage resource that
+// has been flipped as displayable.
+static void *(*scanoutGetStorage)(void *);
+static void *(*scanoutPlaneResource)(void *,uint32_t,uint32_t);
+static mach_vm_address_t scanoutOrgDisplayable,scanoutOrgTransaction;
+static void *scanoutRing[16];
+static volatile uint32_t scanoutNext;
+static volatile uint64_t scanoutUpgrades,scanoutTransactions;
+static void scanoutRecord(void *resource) {
+ if(!resource)return;
+ auto storage=scanoutGetStorage(resource);if(!storage)return;
+ for(unsigned i=0;i<arrsize(scanoutRing);++i)if(__atomic_load_n(&scanoutRing[i],__ATOMIC_ACQUIRE)==storage)return;
+ const auto i=__atomic_fetch_add(&scanoutNext,1,__ATOMIC_RELAXED)%arrsize(scanoutRing);
+ __atomic_store_n(&scanoutRing[i],storage,__ATOMIC_RELEASE);
+}
+// WindowServer's flips arrive as IOAccelDisplayPipeTransaction2s.
+// validateTransaction reads planes 0 and 1, eye 0.
+static uint64_t scanoutPerformTransaction(void *pipe,void *transaction) {
+ __atomic_fetch_add(&scanoutTransactions,1,__ATOMIC_RELAXED);
+ if(transaction)for(uint32_t plane=0;plane<2;++plane)scanoutRecord(scanoutPlaneResource(transaction,plane,0));
+ return FunctionCast(scanoutPerformTransaction,scanoutOrgTransaction)(pipe,transaction);
+}
+// Replaces IGAccelResource::isDisplayableIOSurface entirely (storage+0x1CB bit 3);
+// its original starts with a relative call, so the trampoline is never used.
+static bool scanoutDisplayable(void *resource) {
+ auto storage=static_cast<uint8_t *>(scanoutGetStorage(resource));
+ if(!storage)return false;
+ if(storage[0x1CB]&8)return true;
+ for(unsigned i=0;i<arrsize(scanoutRing);++i)if(__atomic_load_n(&scanoutRing[i],__ATOMIC_ACQUIRE)==storage) {
+  __atomic_fetch_add(&scanoutUpgrades,1,__ATOMIC_RELAXED);return true;
+ }
+ return false;
+}
+static bool scanoutSerialize(void *,void *,OSSerialize *serializer) {
+ uint64_t r[] {2,__atomic_load_n(&scanoutUpgrades,__ATOMIC_RELAXED),
+  __atomic_load_n(&scanoutNext,__ATOMIC_RELAXED),__atomic_load_n(&scanoutTransactions,__ATOMIC_RELAXED)};
+ auto out=OSData::withBytes(r,sizeof(r));if(!out)return false;
+ const bool result=out->serialize(serializer);out->release();return result;
+}
+static bool scanoutCoherentInstall(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
+ static const uint8_t displayHead[] {0x55,0x48,0x89,0xE5,0xE8};
+ static const uint8_t displayTail[] {0x8A,0x80,0xCB,0x01,0,0,0x24,0x08,0xC0,0xE8,0x03,0x5D,0xC3};
+ static const uint8_t transactionHead[] {0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x81,0xEC,0x58,0x01,0,0};
+ const char *display="__ZN15IGAccelResource22isDisplayableIOSurfaceEv";
+ const char *transaction="__ZN18IGAccelDisplayPipe18performTransactionEP30IOAccelDisplayPipeTransaction2";
+ bool ready=size>0x81100 &&
+  patcher.solveSymbol<mach_vm_address_t>(index,display,address,size)==address+0x751D6 &&
+  patcher.solveSymbol<mach_vm_address_t>(index,transaction,address,size)==address+0x80EF0;
+ patcher.clearError();
+ const auto at=reinterpret_cast<const uint8_t *>(address+0x751D6);
+ ready=ready && !memcmp(at,displayHead,sizeof(displayHead)) && !memcmp(at+9,displayTail,sizeof(displayTail)) &&
+  !memcmp(reinterpret_cast<const void *>(address+0x80EF0),transactionHead,sizeof(transactionHead)) &&
+  *reinterpret_cast<const uint8_t *>(address+0x8107E)==0xE8;
+ if(ready) {
+  int32_t rel;memcpy(&rel,at+5,sizeof(rel));
+  scanoutGetStorage=reinterpret_cast<void *(*)(void *)>(address+0x751D6+9+int64_t(rel));
+  // performTransaction's own getPlaneResource(plane,eye) call.
+  memcpy(&rel,reinterpret_cast<const uint8_t *>(address+0x8107F),sizeof(rel));
+  scanoutPlaneResource=reinterpret_cast<void *(*)(void *,uint32_t,uint32_t)>(address+0x81083+int64_t(rel));
+  KernelPatcher::RouteRequest routes[] {{display,scanoutDisplayable,scanoutOrgDisplayable},
+   {transaction,scanoutPerformTransaction,scanoutOrgTransaction}};
+  ready=patcher.routeMultiple(index,routes,arrsize(routes),address,size);
+  patcher.clearError();
+ }
+ auto root=IORegistryEntry::getRegistryRoot();
+ root->setProperty("WEXScanoutCoherentReady",ready);
+ if(ready)if(auto live=OSSerializer::forTarget(nullptr,scanoutSerialize)) {root->setProperty("WEXScanoutCoherent",live);live->release();}
+ return ready;
+}
+
 bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
  if(adlnDetected && tglAcceleratorRequested)dsiBackingHooksReady=processDSIBackingHooks(patcher,index,address,size);
  // Framebuffer-only mode must never enter the donor accelerator probe.
@@ -11386,6 +11515,7 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
  const bool surfaceABIReady=tglInstallSonomaSurfaceABI(patcher,index,address,size,false);
  IORegistryEntry::getRegistryRoot()->setProperty("TGLSonomaSurfaceAcceleratorReady",surfaceABIReady);
  if(adlnDetected && (checkKernelArgument("-wex-adln-kernel-ctx") || adlnNativeRCSProfileRequested))adlnPrepareRCSProfile(patcher,index,address,size);
+ if(checkKernelArgument("-wex-scanout-coherent"))scanoutCoherentInstall(patcher,index,address,size);
    // Serialize only the two direct stores in detectEDRAM. The original
    // forcewake and 1000ms sleep remain outside the shared gate.
    {
@@ -14547,6 +14677,10 @@ bool XE::wrapTGLAcceleratorStart(IOService *that, IOService *provider) {
 	tglRecordStartOrder(6,that,9,0,0,result);
 	SYSLOG("igfx", "TGL accelerator start returned %d", result);
 	if(result && callbackXE->adlnDetected && checkKernelArgument("-wex-adln-kernel-ctx"))adlnRunKernelContextTrial(that);
+	if (result && (callbackXE->adlpDisplaySelected || callbackXE->adlnDetected) && checkKernelArgument("-wex-no-gva-scaler") && that->getProperty("IOGVAScaler")) {
+		that->removeProperty("IOGVAScaler");
+		SYSLOG("igfx", "Display13 va: IOGVAScaler not advertised (-wex-no-gva-scaler)");
+	}
 	return result;
 }
 

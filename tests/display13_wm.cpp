@@ -261,6 +261,23 @@ int main() {
         assert(latch(io,io.snapshot(variable)).status==Status::Readback);
         variable.height=0;assert(latch(io,io.snapshot(variable)).status==Status::Input);
     }
+    {
+        // Pipe-scaler downscale: source height may exceed vtotal, up to 3x (e.g. 3360x1890 @ 165 Hz on 2560x1440).
+        const auto scaledHeight=plan(3360,2720,1205325351ULL,2008,latency,true,true,1890);
+        assert(scaledHeight.status==Status::Complete && scaledHeight.sagv.enable);
+        LatchIO io(scaledHeight);io.moveToPipe(0);io.clock=1305600000;
+        io.regs[0x70190]=((1890U-1)<<16)|(3360U-1);
+        io.regs[0x60000]=((2720U-1)<<16)|(2560U-1);
+        io.regs[0x6000C]=((1559U-1)<<16)|(1440U-1);
+        auto snap=io.snapshot(scaledHeight);snap.pipePixelHz=699840000ULL;
+        snap.pipeLineTime=pipeLineTime(2720,snap.pipePixelHz);
+        io.regs[0x45270]=snap.pipeLineTime;
+        assert(latch(io,snap).status==Status::Complete);
+        auto tooTall=scaledHeight;tooTall.height=3*1559U+1;
+        io.regs[0x70190]=((tooTall.height-1)<<16)|(3360U-1);
+        auto tallSnap=io.snapshot(tooTall);tallSnap.pipePixelHz=snap.pipePixelHz;tallSnap.pipeLineTime=snap.pipeLineTime;
+        assert(latch(io,tallSnap).status==Status::Input);
+    }
     // DSI timing follows transcoder0 while the surface/frame/WM proof stays
     // on the actual pipe. Remove ordinary timings so accidental fallback fails.
     for(unsigned pipe=0;pipe<3;++pipe) {
@@ -319,6 +336,17 @@ int main() {
     assert(clockFits(cursorClockPlan,200000000) && !clockFits(cursorClockPlan,199999999));
     clockPlan.pipePixelHz=200000000;clockPlan.pipeLineTime=pipeLineTime(p.htotal,clockPlan.pipePixelHz);
     assert(!clockFits(clockPlan,199999999) && clockFits(clockPlan,200000000));
+    // A plane scaler left on behind the pipe scaler counts the downscale twice:
+    // above level()'s limit the plan fails and the owner would fault; at twice CDCLK it holds, and fits.
+    const uint64_t doubled=uint64_t(441050000)*25/9*25/9;
+    assert(doubled>2000000000ULL && plan(3200,2080,doubled,1952,latency,false,true,1800).status==Status::WM0);
+    assert(planePixelHz(doubled,1305600000)==1305600000 && planePixelHz(1225138888,1305600000)==1225138888);
+    assert(planePixelHz(doubled,0)==doubled);
+    auto heldPrimary=plan(3200,2080,planePixelHz(doubled,1305600000),1952,latency,false,true,1800);
+    assert(heldPrimary.status==Status::Complete && heldPrimary.sagv.enable);
+    auto heldPlan=committed.snapshot(heldPrimary,nullptr);
+    heldPlan.pipePixelHz=441050000;heldPlan.pipeLineTime=pipeLineTime(heldPrimary.htotal,heldPlan.pipePixelHz);
+    assert(clockFits(heldPlan,1305600000));
     LatchIO afterCrawl(p);afterCrawl.clock=1305600000;
     assert(latch(afterCrawl,afterCrawl.snapshot(p)).status==Status::Complete && afterCrawl.writes.empty());
     LatchIO sameFrame(p);sameFrame.frozen=true;
@@ -469,7 +497,12 @@ int main() {
     assert(!linearLevel(1920,2200,148500000,5000,4096).enable);
     assert(linearLevel(64,100,10000000,3,100).blocks==3); // Both byte counts below one block select method2.
     assert(!linearLevel(0,2200,148500000,3,2008).enable);
-    assert(!linearLevel(1920,1900,148500000,3,2008).enable);
+    // Pipe-scaler downscale: source width may exceed htotal, but not 3x it.
+    assert(linearLevel(1920,1900,148500000,3,2008).enable);
+    assert(!linearLevel(5701,1900,148500000,3,2008).enable);
+    // HP Envy 2880x1800 panel scanning 3200x1800 and 2560x1440 panel scanning 3360x1890 (Y-tiled).
+    assert(yTiledLevel(3200,2960,448000000,3,641).enable);
+    assert(yTiledLevel(3360,2720,1205325351ULL,3,1952).enable);
     assert(!linearLevel(1920,2200,0,3,2008).enable);
     // All supported arithmetic remains bounded even at maximum PCODE block time.
     assert(!linearLevel(16384,16384,2000000000ULL,65793,4096).enable);

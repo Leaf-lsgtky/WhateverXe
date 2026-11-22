@@ -486,5 +486,26 @@ int main() {
      assert(!quiescent(a,state,128,0));}
     {IO b;State state;b.r[0x70008]=0;assert(quiescent(b,state,32,0));
      for(auto reg:b.reads)assert(reg!=0x64000);}
+    // Pipe underruns report once per arming and mask further pipe-level underrun IRQs.
+    {IO u;State us;assert(enable(u,us)==Status::Complete);
+     u.r[Master]=Enable|(1U<<16);u.r[PipeIIR(0)]=0x80000000U;
+     const auto ev=collect(u,us);
+     assert(ev.status==Status::Complete && us.underruns[0]==1 && !(u.r[PipeIIR(0)+4]&PipeUnderruns) && (u.r[PipeIIR(0)-4]&PipeUnderruns)==PipeUnderruns);
+     // Disabled/faulted bank clears Master rather than leaving it armed.
+     us.enabled=false;u.r[Master]=Enable;assert(collect(u,us).status==Status::Unavailable && !(u.r[Master]&Enable));
+    }
+    // Storm breaker trips after StormLimit non-vblank interrupts and resets on vblank.
+    {IO st;State ss;assert(enable(st,ss)==Status::Complete);
+     for(unsigned i=0;i<StormLimit-1;++i) {
+      st.r[Master]=Enable|(1U<<16);st.r[PipeIIR(0)]=8;assert(collect(st,ss).status==Status::Complete);
+     }
+     assert(ss.sinceVBlank==StormLimit-1);
+     st.r[Master]=Enable|(1U<<16);st.r[PipeIIR(0)]=1;assert(collect(st,ss).status==Status::Complete && !ss.sinceVBlank);
+     for(unsigned i=0;i<StormLimit-1;++i) {
+      st.r[Master]=Enable|(1U<<16);st.r[PipeIIR(0)]=8;assert(collect(st,ss).status==Status::Complete);
+     }
+     st.r[Master]=Enable|(1U<<16);st.r[PipeIIR(0)]=8;
+     assert(collect(st,ss).status==Status::Faulted && ss.faulted && ss.storms==1 && !(st.r[Master]&Enable));
+    }
     puts("AlderLakeN Display13 IRQ fixtures passed: powered banks, native events, W1C isolation and fault masking");
 }

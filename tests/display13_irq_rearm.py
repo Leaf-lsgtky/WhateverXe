@@ -23,7 +23,7 @@ struct IORegistryEntry:OSObject {static IORegistryEntry*getRegistryRoot(){static
 constexpr unsigned kIOReturnNotReady=1,kIOReturnSuccess=0;
 bool locked=false;unsigned IOSimpleLockLockDisableInterrupt(void*){assert(!locked);locked=true;return 0;}
 void IOSimpleLockUnlockEnableInterrupt(void*,unsigned){assert(locked);locked=false;}
-struct {IO *base;State state;void *lock=nullptr;bool quiescing=false,powerLost=false,rearmPending=false;
+struct {IO *base;State state;void *lock=nullptr;bool quiescing=false,powerLost=false,rearmPending=false,faultPublished=false;
  uint32_t admittedPipes=7,blockedPipes=0;Status status=Status::Unavailable;}display13FBIRQ;
 struct Display13FBIRQIO {
  IO *io;bool readable(unsigned r){return io->readable(r);}uint32_t read(unsigned r){assert(locked);return io->read(r);}
